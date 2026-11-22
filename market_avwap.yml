@@ -1,0 +1,188 @@
+name: JPX AVWAP full-market daily
+
+on:
+  schedule:
+    - cron: '0 10 * * 1-5' # 19:00 JST, weekdays
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: '200 for testing; 0 for all JPX domestic equities'
+        required: true
+        default: '200'
+        type: choice
+        options:
+          - '200'
+          - '0'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jp-avwap-market
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      expected: ${{ steps.config.outputs.expected }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.txt
+      - name: Select scope
+        id: config
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REQUESTED_LIMIT: ${{ inputs.limit }}
+        shell: bash
+        run: |
+          if [ "$EVENT_NAME" = schedule ]; then limit=0; else limit="${REQUESTED_LIMIT:-200}"; fi
+          echo "limit=$limit" >> "$GITHUB_OUTPUT"
+          echo "expected=$limit" >> "$GITHUB_OUTPUT"
+      - name: Prepare JPX domestic equities
+        env:
+          LIMIT: ${{ steps.config.outputs.limit }}
+        run: python market_prepare.py --limit "$LIMIT" --shards 8
+      - uses: actions/upload-artifact@v4
+        with:
+          name: market-shards
+          path: market_shards/
+          retention-days: 3
+
+  calculate:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        shard: ['00', '01', '02', '03', '04', '05', '06', '07']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.txt
+      - uses: actions/download-artifact@v4
+        with:
+          name: market-shards
+          path: market_shards/
+      - name: Fetch TDnet candidates
+        env:
+          TDNET_TICKERS_FILE: market_shards/tickers_${{ matrix.shard }}.csv
+          TDNET_OUTPUT_FILE: market_results/shard_${{ matrix.shard }}/tdnet_auto_candidates.csv
+          TDNET_SLEEP: '1'
+        run: python tdnet_market.py
+      - name: Calculate AVWAP
+        env:
+          AVWAP_TICKERS_FILE: market_shards/tickers_${{ matrix.shard }}.csv
+          AVWAP_OUTPUT_DIR: market_results/shard_${{ matrix.shard }}
+          TDNET_CANDIDATES_FILE: market_results/shard_${{ matrix.shard }}/tdnet_auto_candidates.csv
+          AVWAP_SLEEP: '1.5'
+        run: python avwap_market.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: market-result-${{ matrix.shard }}
+          path: market_results/shard_${{ matrix.shard }}/
+          if-no-files-found: warn
+          retention-days: 3
+
+  merge:
+    needs: [prepare, calculate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: market-shards
+          path: market_shards/
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: market-result-*
+          path: downloaded/
+      - name: Rebuild shard directories
+        shell: bash
+        run: |
+          mkdir -p market_results
+          for d in downloaded/market-result-*; do
+            [ -d "$d" ] || continue
+            id="${d##*-}"
+            mkdir -p "market_results/shard_${id}"
+            cp -r "$d/." "market_results/shard_${id}/"
+          done
+      - name: Validate coverage and calculations
+        env:
+          EXPECTED_LIMIT: ${{ needs.prepare.outputs.expected }}
+        run: |
+          python - <<'PY'
+          import csv, os
+          from pathlib import Path
+          expected = []
+          actual = []
+          shards = sorted(Path('market_results').glob('shard_*/avwap_latest.csv'))
+          assert len(shards) == 8, f'Expected 8 result shards, found {len(shards)}'
+          for i in range(8):
+              with Path(f'market_shards/tickers_{i:02}.csv').open(encoding='utf-8-sig', newline='') as f:
+                  expected.extend(row['code'] for row in csv.DictReader(f))
+          for p in shards:
+              with p.open(encoding='utf-8-sig', newline='') as f:
+                  actual.extend(csv.DictReader(f))
+          codes = [r['code'] for r in actual]
+          assert len(expected) >= 200, f'Too few expected tickers: {len(expected)}'
+          if os.environ['EXPECTED_LIMIT'] == '0':
+              assert len(expected) >= 3000, f'Full-market run has only {len(expected)} tickers'
+          else:
+              assert len(expected) == int(os.environ['EXPECTED_LIMIT'])
+          assert len(set(expected)) == len(expected), 'Duplicate codes in JPX list'
+          assert len(set(codes)) == len(codes), 'Duplicate result codes'
+          assert set(expected) == set(codes), f'Missing={len(set(expected)-set(codes))}, extra={len(set(codes)-set(expected))}'
+          ok = sum(r.get('status') == 'ok' for r in actual)
+          assert ok >= len(expected) * 0.95, f'Only {ok}/{len(expected)} calculations succeeded'
+          print(f'Validated {len(expected)} unique stocks; successful calculations {ok}')
+          PY
+      - run: python market_merge.py
+      - run: python market_quality.py
+      - run: python avwap_gate.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: JPX-AVWAP-market-results
+          path: market_merged/
+          retention-days: 14
+
+  publish:
+    needs: [prepare, merge]
+    if: ${{ needs.prepare.outputs.expected == '0' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: JPX-AVWAP-market-results
+          path: market_results/
+      - name: Publish verified full-market CSV
+        env:
+          PUBLISH_TOKEN: ${{ secrets.AVWAP_PUBLISH_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$PUBLISH_TOKEN" || { echo 'AVWAP_PUBLISH_TOKEN secret is missing'; exit 1; }
+          test -s market_results/avwap_market_latest.csv
+          git clone https://github.com/hinhama/jp-avwap-data.git public-data
+          mkdir -p public-data/data
+          cp market_results/avwap_market_latest.csv public-data/data/avwap_market_latest.csv
+          cd public-data
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add data/avwap_market_latest.csv
+          if ! git diff --cached --quiet; then
+            git commit -m 'Update full-market AVWAP data'
+            AUTH="$(printf 'x-access-token:%s' "$PUBLISH_TOKEN" | base64 -w0)"
+            git -c "http.extraheader=AUTHORIZATION: basic $AUTH" push origin HEAD:main
+          fi
