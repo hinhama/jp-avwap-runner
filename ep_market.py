@@ -13,9 +13,44 @@ def val(frame, names, date):
 
 def debt(frame, date):
     try: return val(frame, ['Total Debt'], date)
+    except ValueError: pass
+    # Match lease-inclusive or lease-exclusive definitions; never mix buckets.
+    for current, long in [('Current Debt And Capital Lease Obligation','Long Term Debt And Capital Lease Obligation'), ('Current Debt','Long Term Debt')]:
+        try: return val(frame,[current],date)+val(frame,[long],date)
+        except ValueError: pass
+    # A complete component breakdown is acceptable, not a missing bucket.
+    try:
+        return sum(val(frame,[n],date) for n in ['Current Debt','Long Term Debt','Current Capital Lease Obligation','Long Term Capital Lease Obligation'])
+    except ValueError: raise ValueError('missing verified debt breakdown')
+
+def equity(frame,date):
+    try: return val(frame,['Stockholders Equity','Common Stock Equity'],date)
     except ValueError:
-        # Require both maturity buckets; never infer missing debt as zero.
-        return val(frame, ['Current Debt And Capital Lease Obligation','Current Debt'], date) + val(frame, ['Long Term Debt And Capital Lease Obligation','Long Term Debt'], date)
+        return val(frame,['Total Equity Gross Minority Interest'],date)-val(frame,['Minority Interest'],date)
+
+def dated_shares(t,bs,asof):
+    ref=pd.Timestamp(asof).date()
+    try:
+        shares=t.get_shares_full(start=(pd.Timestamp(asof)-pd.Timedelta(days=365)).strftime('%Y-%m-%d'),end=(pd.Timestamp(asof)+pd.Timedelta(days=1)).strftime('%Y-%m-%d'))
+        if isinstance(shares,pd.Series):
+            shares=shares[shares.index.date<=ref].dropna().sort_index()
+            shares=shares[shares>0]
+            if not shares.empty: return float(shares.iloc[-1]),str(shares.index[-1].date()),'dated_share_series'
+    except Exception: pass
+    # Annual statement fallback is a proxy: date is fiscal period end, not publication date.
+    for d in sorted(bs.columns,reverse=True):
+        if d.date()>ref: continue
+        try:
+            n=val(bs,['Ordinary Shares Number'],d)
+            if n<=0: continue
+            h=t.history(start=str(d.date()),end=str(pd.Timestamp(asof).date()+pd.Timedelta(days=1)),auto_adjust=False)
+            if h.empty or 'Stock Splits' not in h or str(h.index[-1].date())!=asof: continue
+            splits=h.loc[h.index.date>d.date(),'Stock Splits']
+            if splits.isna().any(): continue
+            n*=float(splits[splits>0].prod())
+            return n,str(d.date()),'annual_shares_proxy'
+        except Exception: continue
+    raise ValueError('missing verified shares outstanding')
 
 def calculate(nopat, capital, ev, wacc):
     if capital<=0 or ev<=0: raise ValueError('nonpositive capital/EV')
@@ -29,7 +64,7 @@ def inspect(code, asof):
     inc=t.income_stmt; bs=t.balance_sheet; cf=t.cashflow
     dates=sorted(set(inc.columns)&set(bs.columns),reverse=True)
     if len(dates)<4: raise ValueError('need four annual balance sheets')
-    def cap(d): return val(bs,['Stockholders Equity'],d)+debt(bs,d)-val(bs,['Cash And Cash Equivalents'],d)
+    def cap(d): return equity(bs,d)+debt(bs,d)-val(bs,['Cash And Cash Equivalents'],d)
     eps=[]; nops=[]; caps=[]
     for i,d in enumerate(dates[:3]):
         n=val(inc,['Operating Income'],d)*.7; c=(cap(d)+cap(dates[i+1]))/2
@@ -39,11 +74,8 @@ def inspect(code, asof):
     if hist.empty or str(hist.index[-1].date()) != asof: raise ValueError('missing reference-date close')
     if len(hist)<20: raise ValueError('missing prices')
     close=float(hist.Close.iloc[-1]); turnover=float((hist.Close*hist.Volume).tail(20).mean())
-    shares=t.get_shares_full(start=(pd.Timestamp(asof)-pd.Timedelta(days=180)).strftime('%Y-%m-%d'),end=(pd.Timestamp(asof)+pd.Timedelta(days=1)).strftime('%Y-%m-%d'))
-    if shares is None or shares.empty: raise ValueError('missing dated shares outstanding')
-    shares=shares[shares.index.date<=pd.Timestamp(asof).date()].dropna().sort_index()
-    if shares.empty or shares.iloc[-1]<=0: raise ValueError('missing dated shares outstanding')
-    ev=close*float(shares.iloc[-1])+debt(bs,dates[0])-val(bs,['Cash And Cash Equivalents'],dates[0])
+    shares,shares_date,shares_source=dated_shares(t,bs,asof)
+    ev=close*shares+debt(bs,dates[0])-val(bs,['Cash And Cash Equivalents'],dates[0])
     ep,ratio,spread=calculate(nops[0],caps[0],ev,.06)
     growth=ep/eps[1]-1 if eps[1]>0 else None
     cf_values=[]
@@ -54,7 +86,7 @@ def inspect(code, asof):
     liquid=close>=300 and turnover>=1e8
     robust=nops[0]-.08*caps[0]>0
     base=liquid and ep>0 and spread>=.03 and robust and cf_ok and growth is not None and growth>=.10 and eps[0]>eps[1]>eps[2]
-    return dict(status='ok' if None not in cf_values else 'partial_cf',nopat=nops[0],capital=caps[0],shares=float(shares.iloc[-1]),shares_date=str(shares.index[-1].date()),cf_complete=None not in cf_values,sector=info['sector'],financial_date=str(dates[0].date()),price_date=str(hist.index[-1].date()),close=close,turnover20=turnover,ep=ep,ep_previous=eps[1],ep_two_years_ago=eps[2],ep_growth=growth,ev=ev,ep_ev=ratio,spread=spread,ep_wacc8=nops[0]-.08*caps[0],base_pass=base,classification='turnaround_watch' if ep>0 and eps[1]<=0 and liquid and robust and cf_ok else 'review',basis='annual; fixed tax30%; fixed WACC6%; sensitivity8%')
+    return dict(status='proxy_shares' if shares_source=='annual_shares_proxy' else ('ok' if None not in cf_values else 'partial_cf'),nopat=nops[0],capital=caps[0],shares=shares,shares_date=shares_date,shares_source=shares_source,cf_complete=None not in cf_values,sector=info['sector'],financial_date=str(dates[0].date()),price_date=str(hist.index[-1].date()),close=close,turnover20=turnover,ep=ep,ep_previous=eps[1],ep_two_years_ago=eps[2],ep_growth=growth,ev=ev,ep_ev=ratio,spread=spread,ep_wacc8=nops[0]-.08*caps[0],base_pass=base,classification='turnaround_watch' if ep>0 and eps[1]<=0 and liquid and robust and cf_ok else 'review',basis='annual; fixed tax30%; fixed WACC6%; sensitivity8%')
 
 def main():
     p=argparse.ArgumentParser(); p.add_argument('--limit',type=int,default=10); a=p.parse_args()
@@ -64,14 +96,20 @@ def main():
     asof=str(av.loc[av.status.eq('ok'),'price_date'].dropna().max())
     if asof=='nan': raise ValueError('no valid AVWAP reference date')
     rows=[]; target=df if a.limit==0 else df.head(a.limit)
+    if a.limit==100 and Path('ep_pilot_codes.csv').exists():
+        target=pd.read_csv('ep_pilot_codes.csv',dtype={'code':str}).rename(columns={'code':'コード','name':'銘柄名'})
     for _,r in target.iterrows():
         code=str(r['コード']); row={'code':code,'name':r['銘柄名']}
         try: row.update(inspect(code,asof))
-        except Exception as e: row.update(status='unavailable',error=str(e))
+        except Exception as e:
+            msg=str(e)
+            status='special_capital' if 'nonpositive capital' in msg else ('short_history' if 'four annual' in msg else 'unavailable')
+            row.update(status=status,error=msg)
         rows.append(row); print(code,row['status'],flush=True); time.sleep(1)
     out=pd.DataFrame(rows); dest=Path('ep_results'); dest.mkdir(exist_ok=True)
     if 'base_pass' in out:
-        mask=out['base_pass'].eq(True)&out['ep_ev'].ge(.03)
+        mask=out['base_pass'].eq(True)&out['ep_ev'].ge(.03)&out.status.eq('ok')
+        out.loc[out.status.eq('proxy_shares'),'classification']='shares_proxy_review'
         out.loc[mask,'classification']='provisional_pass'
     out.to_csv(dest/'ep_latest.csv',index=False,encoding='utf-8-sig')
     try:
