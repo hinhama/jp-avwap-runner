@@ -1,0 +1,89 @@
+name: EDINET API test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Test EDINET API
+        env:
+          EDINET_API_KEY: ${{ secrets.EDINET_API_KEY }}
+        run: |
+          python - <<'PY'
+          import os
+          import json
+          import urllib.request
+          import urllib.parse
+          import datetime
+
+          key = os.environ["EDINET_API_KEY"]
+          if not key:
+              raise SystemExit("API key is missing")
+
+          base = "https://api.edinet-fsa.go.jp/api/v2"
+          today = datetime.date.today()
+
+          for i in range(7):
+              day = today - datetime.timedelta(days=i)
+              params = urllib.parse.urlencode({
+                  "date": str(day),
+                  "type": 2,
+                  "Subscription-Key": key
+              })
+              try:
+                  with urllib.request.urlopen(
+                      base + "/documents.json?" + params,
+                      timeout=30
+                  ) as response:
+                      data = json.load(response)
+              except Exception:
+                  raise SystemExit("API connection failed")
+
+              status = str(data.get("metadata", {}).get("status"))
+              if status != "200":
+                  raise SystemExit("API status: " + status)
+
+              reports = [
+                  r for r in data.get("results", [])
+                  if r.get("docTypeCode") == "120"
+                  and r.get("xbrlFlag") == "1"
+              ]
+
+              print("Date:", day)
+              print("API connection: OK")
+              print("Annual reports:", len(reports))
+
+              if reports:
+                  report = reports[0]
+                  print("Company:", report.get("filerName"))
+                  print("Document ID:", report.get("docID"))
+
+                  params = urllib.parse.urlencode({
+                      "type": 1,
+                      "Subscription-Key": key
+                  })
+                  try:
+                      url = base + "/documents/" + report["docID"]
+                      with urllib.request.urlopen(
+                          url + "?" + params, timeout=60
+                      ) as response:
+                          content = response.read()
+                  except Exception:
+                      raise SystemExit("Download failed")
+
+                  if not content.startswith(b"PK"):
+                      raise SystemExit("Invalid ZIP response")
+
+                  print("XBRL download: OK")
+                  print("Bytes:", len(content))
+                  break
+          else:
+              raise SystemExit("No annual reports found")
+          PY
