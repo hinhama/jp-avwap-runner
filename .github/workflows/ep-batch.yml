@@ -1,0 +1,26 @@
+name: EP pilot
+on:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: 'Number of stocks (pilot 10; 0 all, not recommended until validated)'
+        default: '10'
+        required: true
+jobs:
+  ep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install pandas requests beautifulsoup4 xlrd openpyxl yfinance
+      - run: python ep_market.py --limit "$LIMIT"
+        env:
+          LIMIT: ${{ inputs.limit }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: EP-pilot-results
+          path: ep_results/
