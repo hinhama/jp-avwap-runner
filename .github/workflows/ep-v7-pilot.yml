@@ -1,0 +1,30 @@
+name: EP v7 pilot cache
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        shard: [0]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - run: pip install pandas requests beautifulsoup4 xlrd openpyxl yfinance
+      - uses: actions/cache@v4
+        with:
+          path: ep_financial_cache
+          key: ep-v7-pilot-${{ github.run_id }}
+          restore-keys: ep-v7-pilot-
+      - run: python ep_market_v7.py --limit 100
+      - uses: actions/upload-artifact@v5
+        with:
+          name: EP-v7-pilot-results
+          path: ep_results/
