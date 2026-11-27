@@ -1,0 +1,81 @@
+name: EP v8 full market
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        shard: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - run: pip install pandas requests beautifulsoup4 xlrd openpyxl yfinance
+      - uses: actions/cache@v4
+        with:
+          path: ep_financial_cache
+          key: ep-v8-${{ matrix.shard }}-${{ github.run_id }}
+          restore-keys: ep-v8-${{ matrix.shard }}-
+      - run: python ep_market_v8.py --limit 0 --shards 20 --shard ${{ matrix.shard }}
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: ep-v8-part-${{ matrix.shard }}
+          path: ep_results/
+  merge:
+    needs: scan
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - run: pip install pandas
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: ep-v8-part-*
+          path: parts
+      - run: |
+          python - <<'PYCODE'
+          import json
+          from pathlib import Path
+          import pandas as pd
+          dest=Path('ep_results'); dest.mkdir(exist_ok=True)
+          paths=[Path('parts')/f'ep-v8-part-{i}' for i in range(20)]
+          issues=[]; summaries=[]; frames=[]; merged=[]
+          for p in paths:
+              try:
+                  s=json.loads((p/'summary.json').read_text())
+                  a=pd.read_csv(p/'ep_latest.csv',dtype={'code':str})
+                  b=pd.read_csv(p/'ep_avwap.csv',dtype={'code':str})
+                  if len(a)!=s['attempted'] or len(b)!=len(a) or set(a.code)!=set(b.code): raise ValueError('row mismatch')
+                  eligible=a[~a.status.eq('excluded_financial')]
+                  rate=eligible.status.isin(['ok','proxy_shares','partial_cf']).mean()
+                  if not rate>=.4: issues.append(f'{p.name}: low success rate {rate}')
+                  summaries.append(s); frames.append(a); merged.append(b)
+              except Exception as e: issues.append(f'{p.name}: {e}')
+          if frames:
+              a=pd.concat(frames,ignore_index=True); b=pd.concat(merged,ignore_index=True)
+              if a.code.duplicated().any() or b.code.duplicated().any(): issues.append('duplicate codes')
+              if len({s['asof'] for s in summaries})!=1: issues.append('mixed dates')
+              if len({s['universe'] for s in summaries})!=1 or len(a)!=summaries[0]['universe']: issues.append('incomplete universe')
+              a.sort_values('code').to_csv(dest/'ep_latest.csv',index=False,encoding='utf-8-sig')
+              b.sort_values('code').to_csv(dest/'ep_avwap.csv',index=False,encoding='utf-8-sig')
+          report={'issues':issues,'shards':len(summaries),'attempted':sum(s['attempted'] for s in summaries),'cache':{k:sum(s.get('cache',{}).get(k,0) for s in summaries) for k in ['hit','miss','saved']},'status':a.status.value_counts().to_dict() if frames else {},'asof':sorted({s['asof'] for s in summaries})}
+          (dest/'summary.json').write_text(json.dumps(report,ensure_ascii=False,indent=2))
+          print(report)
+          if issues: raise SystemExit(1)
+          PYCODE
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: EP-v8-full-results
+          path: ep_results/
