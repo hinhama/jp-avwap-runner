@@ -1,0 +1,72 @@
+name: EP v9 EDINET targeted audit
+on:
+  workflow_dispatch:
+permissions:
+  actions: read
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - run: pip install pandas requests
+      - name: Find successful v8 run
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          id=$(gh run list --workflow ep-v8-full.yml --status success --limit 1 --json databaseId --jq '.[0].databaseId')
+          test -n "$id" && test "$id" != null
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@v5
+        with:
+          name: EP-v8-full-results
+          run-id: ${{ steps.source.outputs.id }}
+          github-token: ${{ github.token }}
+          path: baseline
+      - name: Collect targeted EDINET reports
+        env:
+          EDINET_API_KEY: ${{ secrets.EDINET_API_KEY }}
+        run: |
+          python - <<'PY'
+          import pandas as pd
+          from pathlib import Path
+          a=pd.read_csv('baseline/ep_latest.csv',dtype={'code':str})
+          q=a[a.error.fillna('').str.contains('debt|equity|Equity|Minority Interest',case=False,regex=True)]
+          assert len(q)>0
+          q[['code','name']].to_csv('ep_pilot_codes.csv',index=False)
+          Path('v9_audit').mkdir(exist_ok=True)
+          q.to_csv('v9_audit/targets.csv',index=False)
+          print('Targets:',len(q))
+          PY
+          python edinet_probe.py
+          cp edinet_probe_results/{reports,facts}.csv v9_audit/
+          cp edinet_probe_results/summary.json v9_audit/
+          python - <<'PY'
+          import pandas as pd
+          from edinet_financial import Official
+          o=Official('v9_audit')
+          a=pd.read_csv('v9_audit/targets.csv',dtype={'code':str})
+          import json
+          asof=json.load(open('baseline/summary.json'))['asof'][0]
+          rows=[]
+          for code in a.code:
+              try:
+                  d=o.reports.loc[code,'periodEnd']
+                  for date in [pd.Timestamp(d),pd.Timestamp(d)-pd.DateOffset(years=1)]:
+                      try:
+                          v,parts=o.debt_candidate(code,date,asof)
+                          rows.append(dict(code=code,date=str(date.date()),candidate=v,parts=json.dumps(parts),status='candidate_only'))
+                      except Exception as e: rows.append(dict(code=code,date=str(date.date()),status='unverified',error=str(e)))
+              except Exception: rows.append(dict(code=code,status='report_missing'))
+          pd.DataFrame(rows).to_csv('v9_audit/debt_candidates.csv',index=False)
+          PY
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: EP-v9-audit-results
+          path: v9_audit/
