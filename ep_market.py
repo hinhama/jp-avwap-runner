@@ -18,6 +18,10 @@ def debt(frame, date):
     for current, long in [('Current Debt And Capital Lease Obligation','Long Term Debt And Capital Lease Obligation'), ('Current Debt','Long Term Debt')]:
         try: return val(frame,[current],date)+val(frame,[long],date)
         except ValueError: pass
+    # Explicit zero total debt is already accepted above; zero total liabilities also proves no debt.
+    try:
+        if val(frame,['Total Liabilities Net Minority Interest'],date)==0: return 0.0
+    except ValueError: pass
     # A complete component breakdown is acceptable, not a missing bucket.
     try:
         return sum(val(frame,[n],date) for n in ['Current Debt','Long Term Debt','Current Capital Lease Obligation','Long Term Capital Lease Obligation'])
@@ -100,7 +104,7 @@ def inspect(code, asof, official=None):
     return dict(edinet_fields=';'.join(sorted(set(sources))),status='proxy_shares' if shares_source=='annual_shares_proxy' else ('ok' if None not in cf_values else 'partial_cf'),nopat=nops[0],capital=caps[0],shares=shares,shares_date=shares_date,shares_source=shares_source,cf_complete=None not in cf_values,sector=info['sector'],financial_date=str(dates[0].date()),price_date=str(hist.index[-1].date()),close=close,turnover20=turnover,ep=ep,ep_previous=eps[1],ep_two_years_ago=eps[2],ep_growth=growth,ev=ev,ep_ev=ratio,spread=spread,ep_wacc8=nops[0]-.08*caps[0],base_pass=base,classification='turnaround_watch' if ep>0 and eps[1]<=0 and liquid and robust and cf_ok else 'review',basis='annual; fixed tax30%; fixed WACC6%; sensitivity8%')
 
 def main():
-    p=argparse.ArgumentParser(); p.add_argument('--limit',type=int,default=10); a=p.parse_args()
+    p=argparse.ArgumentParser(); p.add_argument('--limit',type=int,default=10); p.add_argument('--shard',type=int,default=0); p.add_argument('--shards',type=int,default=1); a=p.parse_args(); assert 0<=a.shard<a.shards
     from market_prepare import download_listing
     df,_=download_listing(); df=df[df['市場・商品区分'].str.contains('内国株式',na=False)]
     av=pd.read_csv('https://raw.githubusercontent.com/hinhama/jp-avwap-data/main/data/avwap_market_latest.csv',dtype={'code':str})
@@ -111,6 +115,7 @@ def main():
     rows=[]; target=df if a.limit==0 else df.head(a.limit)
     if a.limit==100 and Path('ep_pilot_codes.csv').exists():
         target=pd.read_csv('ep_pilot_codes.csv',dtype={'code':str}).rename(columns={'code':'コード','name':'銘柄名'})
+    target=target.sort_values('コード').iloc[a.shard::a.shards]
     for _,r in target.iterrows():
         code=str(r['コード']); row={'code':code,'name':r['銘柄名']}
         try: row.update(inspect(code,asof,official))
@@ -121,7 +126,7 @@ def main():
         try:
             d=official.reports.loc[code,'periodEnd']; amount,parts=official.debt_candidate(code,d,asof)
             row.update(edinet_debt_candidate=amount,edinet_debt_parts=json.dumps(parts),edinet_debt_date=d)
-        except (ValueError,KeyError): pass
+        except (ValueError,KeyError,AttributeError): pass
         rows.append(row); print(code,row['status'],flush=True); time.sleep(1)
     out=pd.DataFrame(rows); dest=Path('ep_results'); dest.mkdir(exist_ok=True)
     if 'base_pass' in out:
