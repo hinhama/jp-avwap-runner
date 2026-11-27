@@ -1,0 +1,74 @@
+name: EP v6 recovery
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - run: pip install pandas requests beautifulsoup4 xlrd openpyxl yfinance
+      - uses: actions/download-artifact@v5
+        with:
+          github-token: ${{ github.token }}
+          run-id: '45937782653'
+          pattern: ep-part-*
+          path: parts
+      - name: Inspect and recover
+        run: |
+          python - <<'PY'
+          import json, subprocess, shutil
+          from pathlib import Path
+          import pandas as pd
+          from market_prepare import download_listing
+          root=Path('parts')
+          folders=[root/f'ep-part-{i}' for i in range(20)]
+          summaries=[json.loads((p/'summary.json').read_text()) for p in folders]
+          assert len({s['asof'] for s in summaries})==1
+          asof=summaries[0]['asof']
+          listing,_=download_listing()
+          listing=listing[listing['市場・商品区分'].str.contains('内国株式',na=False)].sort_values('コード')
+          assert '33業種区分' in listing.columns
+          assert len(listing)==summaries[0]['universe']
+          expected=set(listing['コード'].astype(str))
+          source=Path('ep_market.py').read_text()
+          old="t=yf.Ticker(code+'.T'); info=t.get_info()\n    if info.get('sector')=='Financial Services': return {'status':'excluded_financial'}\n    if not info.get('sector'): raise ValueError('missing sector')"
+          new="t=yf.Ticker(code+'.T'); info={'sector': sector}\n    if sector in ('銀行業','証券、商品先物取引業','保険業','その他金融業'): return {'status':'excluded_financial'}\n    if not sector or sector=='nan': raise ValueError('missing JPX sector')"
+          assert old in source
+          source=source.replace(old,new).replace('def inspect(code, asof, official=None):','def inspect(code, asof, official=None, sector=None):').replace('inspect(code,asof,official)','inspect(code,asof,official,str(r["33業種区分"]))')
+          source=source.replace("asof=str(av.loc[av.status.eq('ok'),'price_date'].dropna().max())", "asof=str(av.loc[av.status.eq('ok'),'price_date'].dropna().max()); assert asof=="+repr(asof)+", 'AVWAP date changed; recovery stopped'")
+          source=source.replace("merged['avwap_aligned']=", "if 'price_date_avwap' not in merged and 'price_date' in merged: merged=merged.rename(columns={'price_date':'price_date_avwap'})\n        if 'status_avwap' not in merged: raise ValueError('missing AVWAP status')\n        merged['avwap_aligned']=")
+          Path('ep_market.py').write_text(source)
+          def read(p): return pd.read_csv(p,dtype={'code':str})
+          def quality(d): return d.status.isin(['ok','proxy_shares','partial_cf']).mean()
+          for i,p in enumerate(folders):
+              d=read(p/'ep_latest.csv'); codes=set(listing.iloc[i::20]['コード'].astype(str))
+              assert set(d.code)==codes and not d.code.duplicated().any(), f'Universe changed in shard {i}'
+              bad=quality(d)<.4 or not (p/'ep_avwap.csv').exists()
+              print(i,len(d),quality(d),'retry' if bad else 'reuse',flush=True)
+              if not bad: continue
+              shutil.rmtree('ep_results',ignore_errors=True)
+              subprocess.run(['python','ep_market.py','--limit','0','--shards','20','--shard',str(i)],check=True)
+              q=Path('ep_results'); fresh=read(q/'ep_latest.csv')
+              assert set(fresh.code)==codes and not fresh.code.duplicated().any()
+              assert quality(fresh)>=.4 and (q/'ep_avwap.csv').exists(), f'Shard {i} still unhealthy'
+              assert json.loads((q/'summary.json').read_text())['asof']==asof
+              shutil.copytree(q,p,dirs_exist_ok=True)
+          dest=Path('ep_results'); shutil.rmtree(dest,ignore_errors=True); dest.mkdir()
+          for name in ['ep_latest.csv','ep_avwap.csv']:
+              out=pd.concat([read(p/name) for p in folders],ignore_index=True)
+              assert not out.code.duplicated().any() and set(out.code)==expected
+              out.sort_values('code').to_csv(dest/name,index=False,encoding='utf-8-sig')
+          d=read(dest/'ep_latest.csv')
+          (dest/'summary.json').write_text(json.dumps({'asof':asof,'attempted':len(d),'status':d.status.value_counts().to_dict(),'basis':'annual fixed WACC; mixed JPX/Yahoo sector labels; provisional'},ensure_ascii=False,indent=2))
+          PY
+      - uses: actions/upload-artifact@v5
+        with:
+          name: EP-recovered-results
+          path: ep_results/
