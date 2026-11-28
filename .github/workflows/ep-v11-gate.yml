@@ -1,0 +1,71 @@
+name: EP v11 gate repair
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: 'Successful EP v10 run ID (blank = latest successful run)'
+        required: false
+        type: string
+permissions:
+  contents: read
+  actions: read
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - run: pip install pandas yfinance
+      - name: Download previous results
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.run_id }}
+        run: |
+          set -eu
+          id="$RUN_ID"
+          if [ -z "$id" ]; then
+            id=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ep-v10-daily.yml --status success --limit 1 --json databaseId --jq '.[0].databaseId')
+          fi
+          test -n "$id"
+          gh run download "$id" --repo "$GITHUB_REPOSITORY" --name EP-v10-daily-results --dir ep_results
+      - name: Recalculate market gate
+        run: |
+          python - <<'PY'
+          import json, time
+          from pathlib import Path
+          import pandas as pd
+          import yfinance as yf
+          p=Path('ep_results')
+          report=json.loads((p/'summary.json').read_text())
+          assert not report['issues'] and report['shards']==20 and len(report['asof'])==1
+          asof=report['asof'][0]; end=pd.Timestamp(asof)+pd.Timedelta(days=1); start=end-pd.Timedelta(days=730)
+          gate={'grade':'unknown','asof':asof,'attempts':[]}
+          for attempt in range(3):
+              for method in ['history','download']:
+                  try:
+                      kw=dict(start=start.strftime('%Y-%m-%d'),end=end.strftime('%Y-%m-%d'),auto_adjust=False)
+                      h=yf.Ticker('^N225').history(**kw) if method=='history' else yf.download('^N225',**kw,progress=False,threads=False)
+                      c=h['Close']; c=c.iloc[:,0] if isinstance(c,pd.DataFrame) else c
+                      idx=pd.DatetimeIndex(c.index)
+                      if idx.tz is not None: idx=idx.tz_convert('Asia/Tokyo').tz_localize(None)
+                      c.index=idx.normalize(); c=c.dropna().sort_index(); c=c[~c.index.duplicated(keep='last')]; c=c[c.index<=pd.Timestamp(asof)]
+                      last=str(c.index[-1].date()) if len(c) else None
+                      gate['attempts'].append({'method':method,'rows':len(c),'last':last})
+                      if len(c)<205 or last!=asof: continue
+                      ma={n:float(c.tail(n).mean()) for n in [5,25,75,200]}; close=float(c.iloc[-1]); rising=ma[25]>float(c.iloc[:-5].tail(25).mean())
+                      grade='A' if close>ma[5]>ma[25]>ma[75]>ma[200] and rising else ('C' if close<ma[25] and not rising else 'B')
+                      gate.update(grade=grade,close=close,ma=ma,ma25_rising=rising,reason='provisional daily MA gate; no hysteresis',source='Yahoo Finance ^N225')
+                      break
+                  except Exception as e: gate['attempts'].append({'method':method,'error':str(e)})
+              if gate['grade']!='unknown': break
+              time.sleep(5*(attempt+1))
+          w=pd.read_csv(p/'ep_watchlist.csv',dtype={'code':str}); w['market_gate']=gate['grade']; w['decision']='watch_only'; w.to_csv(p/'ep_watchlist.csv',index=False,encoding='utf-8-sig')
+          (p/'market_gate.json').write_text(json.dumps(gate,ensure_ascii=False,indent=2)); print(gate)
+          if gate['grade']=='unknown': raise SystemExit('Nikkei data not verified; see artifact')
+          PY
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: EP-v11-gate-results
+          path: ep_results/
